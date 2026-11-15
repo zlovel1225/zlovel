@@ -1,0 +1,42 @@
+/* 手机上的修改面板和组装面板可以按住标题上下拖，避免挡住蛋糕。 */
+(function () {
+  if (window.__wzSheet) return;
+  window.__wzSheet = true;
+  var query = window.matchMedia("(max-width: 899px)");
+
+  function bind(panel, handle) {
+    if (!panel || !handle || handle.dataset.wzDrag) return;
+    handle.dataset.wzDrag = "1";
+    var startY = 0;
+    var startH = 0;
+    var dragging = false;
+    handle.addEventListener("pointerdown", function (event) {
+      if (!query.matches || event.button > 0) return;
+      if (event.target.closest && event.target.closest("button, a, input, textarea, select, label")) return;
+      dragging = true;
+      startY = event.clientY;
+      startH = panel.getBoundingClientRect().height;
+      panel.style.transition = "none";
+      if (handle.setPointerCapture) handle.setPointerCapture(event.pointerId);
+    });
+    handle.addEventListener("pointermove", function (event) {
+      if (!dragging) return;
+      var limit = Math.round(window.innerHeight * 0.72);
+      var next = startH + (startY - event.clientY);
+      next = Math.max(84, Math.min(limit, next));
+      panel.style.height = next + "px";
+      panel.style.maxHeight = limit + "px";
+    });
+    function end() { dragging = false; }
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+  }
+
+  function boot() {
+    bind(document.querySelector(".studio"), document.querySelector(".studio .st-head"));
+    bind(document.querySelector(".build-dock"), document.querySelector(".build-dock .bd-head"));
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+  else boot();
+})();

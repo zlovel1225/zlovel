@@ -1,0 +1,95 @@
+<script>
+window.__WISHY_DELIVERY__ = true;
+</script>
+<script>
+(function () {
+  'use strict';
+  if (window.WishyPreview) return;
+  if (window.__WISHY_DELIVERY__ === true) {
+    window.WishyPreview = { active: false, running: function () { return true; }, tick: function (dt) { return dt; }, draw: function () {}, locked: function () {}, start: function () {} };
+    return;
+  }
+  var parentPreview, elapsed = 0;
+  try { if (parent !== window && parent.WishyPreview && parent.WishyPreview.active) parentPreview = parent.WishyPreview; } catch (_) {}
+  var editorControls = '#birthday-editor,#build-dock,#customize-btn,#build-open,.gw-bar,.controls,.mk-bar,.mk-modal,.wz-overlay';
+  function running() { return !document.hidden && (!parentPreview || parentPreview.running()); }
+  function start() {
+    if (parentPreview) return parentPreview.start();
+    window.dispatchEvent(new CustomEvent('wishy:preview-start'));
+  }
+  window.WishyPreview = {
+    active: true, running: running, start: start, stop: function () {}, locked: function () {},
+    tick: function (dt) { var step = running() ? dt : 0; elapsed += step; return step; },
+    time: function () { return elapsed; }, draw: function () {},
+  };
+  if (parentPreview) return;
+  var maskUpdatedAt = -Infinity;
+  function updateMask(watermark, now) {
+    requestAnimationFrame(function (time) { updateMask(watermark, time); });
+    if (document.hidden || typeof now === 'number' && now - maskUpdatedAt < 100) return;
+    maskUpdatedAt = typeof now === 'number' ? now : performance.now();
+    var width = innerWidth, height = innerHeight;
+    var clearAreas = [];
+    function collect(doc, x, y, sx, sy, clip, depth) {
+      function bounds(control) {
+        var style = doc.defaultView.getComputedStyle(control), rect = control.getBoundingClientRect();
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || !rect.width || !rect.height) return;
+        var area = [Math.max(clip[0], x + rect.left * sx), Math.max(clip[1], y + rect.top * sy), Math.min(clip[2], x + rect.right * sx), Math.min(clip[3], y + rect.bottom * sy)];
+        return area[2] > area[0] && area[3] > area[1] ? area : null;
+      }
+      doc.querySelectorAll(editorControls).forEach(function (control) { var area = bounds(control); if (area) clearAreas.push(area); });
+      if (depth >= 3) return;
+      doc.querySelectorAll('iframe').forEach(function (frame) {
+        var area = bounds(frame); if (!area) return;
+        try {
+          if (!frame.contentDocument) return;
+          var rect = frame.getBoundingClientRect(), child = frame.contentWindow;
+          collect(frame.contentDocument, x + rect.left * sx, y + rect.top * sy, sx * rect.width / child.innerWidth, sy * rect.height / child.innerHeight, area, depth + 1);
+        } catch (_) {}
+      });
+    }
+    collect(document, 0, 0, 1, 1, [0, 0, width, height], 0);
+    var view = window, x = 0, y = 0, sx = 1, sy = 1;
+    for (var depth = 0; depth < 3; depth++) {
+      try {
+        var frame = view.frameElement;
+        if (!frame || view.parent === view) break;
+        var rect = frame.getBoundingClientRect();
+        if (!rect.width || !rect.height || !view.innerWidth || !view.innerHeight) break;
+        sx *= view.innerWidth / rect.width; sy *= view.innerHeight / rect.height;
+        x -= rect.left * sx; y -= rect.top * sy;
+        view = view.parent;
+        collect(view.document, x, y, sx, sy, [0, 0, width, height], 3);
+      } catch (_) { break; }
+    }
+    var regions = [[0, 0, width, height]];
+    clearAreas.forEach(function (area) {
+      var next = [];
+      regions.forEach(function (region) {
+        var left = Math.max(region[0], area[0]), top = Math.max(region[1], area[1]);
+        var right = Math.min(region[2], area[2]), bottom = Math.min(region[3], area[3]);
+        if (right <= left || bottom <= top) { next.push(region); return; }
+        if (region[0] < left) next.push([region[0], region[1], left, region[3]]);
+        if (right < region[2]) next.push([right, region[1], region[2], region[3]]);
+        if (region[1] < top) next.push([left, region[1], right, top]);
+        if (bottom < region[3]) next.push([left, bottom, right, region[3]]);
+      });
+      regions = next;
+    });
+    var path = regions.map(function (r) { return 'M' + r[0] + ' ' + r[1] + 'H' + r[2] + 'V' + r[3] + 'H' + r[0] + 'Z'; }).join('');
+    var nextClip = regions.length ? 'path("' + path + '")' : 'inset(50%)';
+    if (watermark.style.clipPath !== nextClip) watermark.style.clipPath = nextClip;
+  }
+  function mount() {
+    var style = document.createElement('style');
+    style.textContent = '.wishy-preview-watermark{position:fixed;inset:0;z-index:2147482990;pointer-events:none;overflow:hidden}.wishy-preview-watermark-grid{position:absolute;inset:-180px;display:flex;flex-wrap:wrap;align-content:space-around;justify-content:space-around;gap:70px 45px;transform:rotate(-23deg);color:#fff4;font:600 16px/1.5 system-ui,sans-serif;text-shadow:0 1px 3px #0009}.wishy-preview-watermark span{white-space:nowrap;animation:wishy-preview-drift 30s linear infinite}@keyframes wishy-preview-drift{to{transform:translate(50px,20px)}}@media(max-width:600px){.wishy-preview-watermark-grid{font-size:14px}}';
+    document.head.append(style);
+    var watermark = document.createElement('div'); watermark.className = 'wishy-preview-watermark'; watermark.setAttribute('aria-hidden', 'true');
+    var grid = document.createElement('div'); grid.className = 'wishy-preview-watermark-grid'; watermark.append(grid);
+    for (var i = 0; i < 80; i++) { var word = document.createElement('span'); word.textContent = ''; grid.append(word); }
+    document.body.append(watermark);
+    updateMask(watermark);
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount); else mount();
+})();
+</script>

@@ -1,0 +1,69 @@
+/* Wishy music: local songs are fetched only after selection; custom uploads keep the 10 MiB contract. */
+(function (root) {
+  'use strict';
+  if (root.WishyAudio) return;
+  var tracks = Object.freeze([
+    { id: 'birthday-musicbox', label: '生日快乐 · 八音盒' },
+    { id: 'birthday-piano', label: '生日快乐 · 钢琴' },
+    { id: 'twinkle-musicbox', label: '小星星 · 八音盒' },
+    { id: 'ode-piano', label: '欢乐颂 · 钢琴' },
+    { id: 'canon-piano', label: '卡农 · 钢琴' }
+  ].map(Object.freeze));
+  var cache = new Map(), maximum = 10 * 1024 * 1024;
+  var script = root.document && root.document.currentScript;
+  var base = script && script.src ? script.src : root.document && root.document.baseURI;
+  var guarded = new WeakSet();
+  function source(id) {
+    if (!tracks.some(function (track) { return track.id === id; })) throw new Error('请选择曲库里的音乐。');
+    return new URL('music/' + id + '.mp3', base).href;
+  }
+  function remember(audio) {
+    if (!audio || guarded.has(audio)) return audio;
+    guarded.add(audio);
+    var nativePlay = audio.play.bind(audio);
+    audio.play = function () {
+      return audio.__wishyUserPaused ? Promise.resolve() : nativePlay();
+    };
+    return audio;
+  }
+  function play(audio) {
+    if (!audio || !audio.src) return Promise.resolve(false);
+    remember(audio);
+    audio.__wishyUserPaused = false; audio.muted = false;
+    // Keep play() synchronous with the tap: Safari loses activation across fetch/FileReader awaits.
+    try { return Promise.resolve(audio.play()).then(function () { return !audio.paused; }, function () { return false; }); }
+    catch (_) { return Promise.resolve(false); }
+  }
+  function pause(audio) {
+    if (!audio) return;
+    remember(audio); audio.__wishyUserPaused = true; audio.pause();
+  }
+  function toggle(audio) {
+    if (!audio) return Promise.resolve(false);
+    if (!audio.paused && !audio.muted) { pause(audio); return Promise.resolve(false); }
+    return play(audio);
+  }
+  function dataUrl(blob) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('音频无法读取，请重新选择。')); };
+      reader.onerror = function () { reject(new Error('音频无法读取，请重新选择。')); };
+      reader.readAsDataURL(blob);
+    });
+  }
+  function builtin(id) {
+    if (!tracks.some(function (track) { return track.id === id; })) return Promise.reject(new Error('请选择曲库里的音乐。'));
+    if (cache.has(id)) return cache.get(id);
+    var pending = fetch(source(id), { credentials: 'same-origin', cache: 'force-cache' })
+      .then(function (response) {
+        if (!response.ok || Number(response.headers.get('content-length') || 0) > maximum) throw new Error('这首音乐没加载出来，请重试。');
+        return response.blob();
+      }).then(function (blob) {
+        if (!blob.size || blob.size > maximum) throw new Error('这首音乐没加载出来，请重试。');
+        return dataUrl(blob.type === 'audio/mpeg' ? blob : blob.slice(0, blob.size, 'audio/mpeg'));
+      }).catch(function (error) { cache.delete(id); throw error; });
+    cache.set(id, pending);
+    return pending;
+  }
+  root.WishyAudio = Object.freeze({ tracks: tracks, source: source, builtin: builtin, play: play, pause: pause, toggle: toggle, guard: remember });
+})(window);

@@ -1,0 +1,263 @@
+/* 草稿整份写入 IndexedDB；提交成功后才提示保存，失败保留上一份快照。 */
+(function () {
+  'use strict';
+  var query = new URLSearchParams(location.search);
+  if (query.get('studio') !== '1' || query.get('combination') !== '1' || parent === window) return;
+  try { if (parent.location.origin !== location.origin) return; } catch (_) { return; }
+  document.documentElement.dataset.wzCombination = 'true';
+  window.__parentMusic = true;
+  var style = document.createElement('style');
+  style.textContent = '#start-gate,#audio-gate,#count-ov,#toggle-music,#particle-music,.wz-bgm{display:none!important}';
+  document.head.append(style);
+  var nativePlay = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function () {
+    return this === window.__bgm || this.id === 'background-music' || this.id === 'music-src'
+      ? Promise.resolve() : nativePlay.call(this);
+  };
+  var requested = false, started = false;
+  function start() {
+    if (started) return;
+    if (document.readyState === 'loading') { requested = true; return; }
+    started = true;
+    document.getElementById('start-gate')?.click();
+    document.getElementById('audio-gate')?.click();
+  }
+  window.__wzCombinationStart = start;
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { if (requested) start(); }, { once: true });
+})();
+(function () {
+  'use strict';
+  var PREFIX = 'wishy-design-draft-v1:';
+  var AUTO_FORMAT = 'wishy-draft-autosave-v1';
+  var PAGES = ['heart', 'bless', 'trio', 'heartlily', 'heartsnow', 'diy', 'lily', 'snow', 'rose', 'particle-cake', 'particle-cake-music'];
+  var page = location.pathname.split('/').pop().replace(/\.html$/, '');
+  var cache = new Map(), revisions = new Map(), localRevisions = new Map();
+  var database, scope, identity, loaded = false, pendingMedia = 0, saving = 0, submitting = false, lastFailure;
+  function session() {
+    try {
+      var value = JSON.parse(localStorage.getItem('wishy-session') || 'null');
+      return value && value.tokenName === 'Authorization' && typeof value.tokenValue === 'string' && value.tokenValue ? value : null;
+    } catch (_) { return null; }
+  }
+  function identityOf(value) { return value ? value.tokenValue : 'anonymous'; }
+  function sameOwner() { return identity === identityOf(session()); }
+  function clone(value) { return JSON.parse(JSON.stringify(value)); }
+  function object(value) { return value && typeof value === 'object' && !Array.isArray(value); }
+  function legacy(key, ownerScope) {
+    var partition = ownerScope || scope;
+    if (!partition) return null;
+    try { var value = JSON.parse(localStorage.getItem(PREFIX + (partition === 'anonymous' ? '' : partition + ':') + key) || 'null'); return object(value) ? value : null; }
+    catch (_) { return null; }
+  }
+  function localRevision(value) { return value && value.format === AUTO_FORMAT && Number.isSafeInteger(value.localRevision) && value.localRevision >= 0 ? value.localRevision : 0; }
+  function rememberLocalRevisions() {
+    (PAGES.indexOf(page) >= 0 ? [page] : ['studio']).forEach(function (key) { localRevisions.set(key, localRevision(legacy(key))); });
+  }
+  function track(work) { pendingMedia++; return work.finally(function () { pendingMedia--; }); }
+  function isPending() { return !loaded || saving > 0 || pendingMedia > 0 || !!(window.__wzPendingMedia && window.__wzPendingMedia()); }
+  function read(key) {
+    if (!loaded || !sameOwner()) return null;
+    var value = legacy(key);
+    // 自动保存只能接续自己读到的提交版本，旧标签页不能遮住其他标签的新草稿。
+    if (value && value.format === AUTO_FORMAT) {
+      value = object(value.value) && ((!database && !revisions.has(key)) || value.revision === (revisions.get(key) || 0)) ? value.value : null;
+    } else if (database && cache.has(key)) value = null;
+    value = value || cache.get(key);
+    return object(value) ? clone(value) : null;
+  }
+  // 原场景的同步自动保存保留小草稿兼容路径；完整媒体由手动保存事务提交。
+  function save(key, value) {
+    if (!loaded || !sameOwner() || !scope) return false;
+    try {
+      var revision = localRevision(legacy(key));
+      // 启动后若别的标签已更新自动稿，本页只能保留内存编辑，不能同步覆盖新稿。
+      if (revision !== (localRevisions.get(key) || 0)) { lastFailure = 'conflict'; return false; }
+      var saved = { format: AUTO_FORMAT, revision: revisions.get(key) || 0, localRevision: revision + 1, value: value };
+      localStorage.setItem(PREFIX + (scope === 'anonymous' ? '' : scope + ':') + key, JSON.stringify(saved));
+      localRevisions.set(key, saved.localRevision);
+      return true;
+    }
+    catch (_) { return false; }
+  }
+  function personalPage() { return PAGES.indexOf(page) >= 0 && !window.__BIRTHDAY_CONFIG__ && !window.__WZ_STUDIO__ && !new URLSearchParams(location.search).has('tpl'); }
+  function readCurrent() {
+    if (!personalPage()) return null;
+    if (!loaded) return null;
+    // 登录账号没有草稿时也覆盖旧模板的匿名 localStorage，避免回显别人的作品。
+    return read(page) || (session() ? {} : null);
+  }
+  async function sessionScope(value) {
+    var bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value.tokenValue));
+    return 'session:' + Array.from(new Uint8Array(bytes)).map(function (byte) { return byte.toString(16).padStart(2, '0'); }).join('');
+  }
+  // 账号资料可能在保存成功之后才返回；只恢复同一会话的旧分区，已有账号草稿始终优先。
+  async function recoverSessionDraft(key, value) {
+    if (!scope || scope.indexOf('user:') !== 0 || cache.has(key) || legacy(key)) return;
+    var oldScope = await sessionScope(value);
+    if (!sameOwner()) return;
+    function candidate(record) {
+      var local = legacy(key, oldScope);
+      if (local && local.format === AUTO_FORMAT)
+        local = object(local.value) && (!database || local.revision === (record && record.revision || 0)) ? local.value : null;
+      else if (record) local = null;
+      return local || record && record.value;
+    }
+    if (!database) {
+      var fallback = candidate(null);
+      if (object(fallback) && !legacy(key))
+        localStorage.setItem(PREFIX + scope + ':' + key, JSON.stringify(fallback));
+      return;
+    }
+    await new Promise(function (resolve, reject) {
+      var transaction = database.transaction('drafts', 'readwrite');
+      var store = transaction.objectStore('drafts'), result;
+      var target = store.get(scope + ':' + key);
+      target.onsuccess = function () {
+        if (target.result || legacy(key) || !sameOwner()) { result = target.result; return; }
+        var previous = store.get(oldScope + ':' + key);
+        previous.onsuccess = function () {
+          var snapshot = candidate(previous.result);
+          if (!object(snapshot) || !sameOwner()) return;
+          result = { key: scope + ':' + key, value: snapshot, revision: 1 };
+          store.put(result);
+        };
+      };
+      transaction.oncomplete = function () {
+        if (result && object(result.value)) { cache.set(key, result.value); revisions.set(key, result.revision); }
+        resolve();
+      };
+      transaction.onerror = transaction.onabort = reject;
+    });
+  }
+  function clean(value) { var state = clone(value); delete state.gatePwd; delete state.gateHint; return state; }
+  function saveCurrent(value) { return personalPage() && !isPending() ? save(page, clean(value)) : false; }
+  var ready = (async function () {
+    var value = session(); identity = identityOf(value);
+    if (!value) scope = 'anonymous';
+    else if (typeof value.draftUserId === 'string' && /^\d+$/.test(value.draftUserId)) scope = 'user:' + value.draftUserId;
+    else {
+      // 老会话按摘要隔离，不把令牌作为数据库键保存。
+      try {
+        scope = await sessionScope(value);
+      } catch (_) { scope = null; }
+    }
+    if (!scope) { loaded = true; return; }
+    var keys = PAGES.indexOf(page) >= 0 ? [page] : ['studio'];
+    if (!window.indexedDB) {
+      try {
+        if (scope.indexOf('user:') === 0) for (var key of keys) await recoverSessionDraft(key, value);
+      } catch (_) { /* 迁移失败保留原分区。 */ }
+      rememberLocalRevisions(); loaded = true; return;
+    }
+    try {
+      database = await new Promise(function (resolve, reject) {
+        var request = window.indexedDB.open('wishy-design-drafts', 1);
+        request.onupgradeneeded = function () { request.result.createObjectStore('drafts', { keyPath: 'key' }); };
+        request.onsuccess = function () { resolve(request.result); };
+        request.onerror = request.onblocked = function () { reject(new Error('草稿存储不可用')); };
+      });
+      database.onversionchange = function () { database.close(); database = undefined; };
+      await new Promise(function (resolve, reject) {
+        var transaction = database.transaction('drafts', 'readonly');
+        // 单个作品只读自己的大媒体，组合页才读取整份组合，避免首页逐份加载音频。
+        (PAGES.indexOf(page) >= 0 ? [page] : ['studio']).forEach(function (key) {
+          var request = transaction.objectStore('drafts').get(scope + ':' + key);
+          request.onsuccess = function () {
+            var saved = request.result;
+            if (saved && object(saved.value)) { cache.set(key, saved.value); revisions.set(key, saved.revision); }
+          };
+        });
+        transaction.oncomplete = resolve;
+        transaction.onerror = transaction.onabort = reject;
+      });
+    } catch (_) { database = undefined; }
+    try {
+      if (scope.indexOf('user:') === 0) for (var key of keys) await recoverSessionDraft(key, value);
+    } catch (_) { /* 迁移失败保留原分区。 */ }
+    rememberLocalRevisions(); loaded = true;
+  })();
+  /** 一次事务比较版本并提交，旧标签页不能覆盖另一标签页已经保存的新作品。 */
+  async function saveAsync(key, value) {
+    await ready;
+    lastFailure = undefined;
+    if (!sameOwner() || !scope || saving || pendingMedia || (window.__wzPendingMedia && window.__wzPendingMedia())) return false;
+    var snapshot;
+    try { snapshot = clean(value); } catch (_) { return false; }
+    saving++;
+    try {
+      var current = session();
+      var accountScope = current && typeof current.draftUserId === 'string' && /^\d+$/.test(current.draftUserId) ? 'user:' + current.draftUserId : null;
+      if (accountScope && accountScope !== scope) {
+        // 当前会话首次取得已验证的用户 id 后迁入账号分区；不复制匿名草稿。
+        var existing = database && await new Promise(function (resolve, reject) {
+          var transaction = database.transaction('drafts', 'readonly');
+          var request = transaction.objectStore('drafts').get(accountScope + ':' + key);
+          request.onsuccess = function () { resolve(request.result); };
+          request.onerror = reject;
+        });
+        if (!sameOwner()) return false;
+        // 本页从未读取过目标账号草稿，不能靠接收最新版本号绕过冲突检查。
+        if (existing || legacy(key, accountScope)) { lastFailure = 'account-conflict'; return false; }
+        scope = accountScope;
+        cache.clear(); revisions.clear(); localRevisions.clear();
+        rememberLocalRevisions();
+      }
+      if (!database) return save(key, snapshot);
+      var revision = (revisions.get(key) || 0) + 1;
+      var committed = await new Promise(function (resolve) {
+        var transaction = database.transaction('drafts', 'readwrite');
+        var store = transaction.objectStore('drafts'), recordKey = scope + ':' + key;
+        var request = store.get(recordKey);
+        request.onsuccess = function () {
+          if (!sameOwner()) { transaction.abort(); return; }
+          if ((request.result && request.result.revision || 0) !== (revisions.get(key) || 0)) {
+            lastFailure = 'conflict'; transaction.abort(); return;
+          }
+          if (localRevision(legacy(key)) !== (localRevisions.get(key) || 0)) {
+            lastFailure = 'conflict'; transaction.abort(); return;
+          }
+          store.put({ key: recordKey, value: snapshot, revision: revision });
+        };
+        transaction.oncomplete = function () { resolve(true); };
+        transaction.onerror = transaction.onabort = function () { resolve(false); };
+      });
+      if (committed) {
+        cache.set(key, snapshot); revisions.set(key, revision);
+        // 小型版本标记取代旧自动稿，数据库暂不可读时不能恢复已过时的正文。
+        save(key, null);
+      }
+      return committed;
+    } catch (_) { return false; }
+    finally { saving--; }
+  }
+  window.WishyDrafts = { ready: ready, read: read, save: save, saveAsync: saveAsync, readCurrent: readCurrent, saveCurrent: saveCurrent, track: track, isPending: isPending };
+  window.addEventListener('beforeunload', function (event) { if (saving || submitting) { event.preventDefault(); event.returnValue = ''; } });
+  document.addEventListener('click', async function (event) {
+    if (submitting && event.target.closest && event.target.closest('a[href], [data-href], [data-a="back"], #be-save')) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      return;
+    }
+    if (!event.target.closest || !event.target.closest('#be-save')) return;
+    event.preventDefault(); event.stopImmediatePropagation();
+    var status = document.getElementById('be-status');
+    if (typeof window.__wzState !== 'function' || isPending()) {
+      if (status) status.textContent = '作品或文件还在加载，请稍后再保存草稿。';
+      return;
+    }
+    if (status) status.textContent = '正在保存草稿，请稍候…';
+    var saved = false;
+    submitting = true;
+    try {
+      if (window.__WZ_STUDIO__) {
+        if (parent.location.origin === location.origin && parent.WZ && parent.WZ.saveDraft) saved = await parent.WZ.saveDraft();
+      } else if (personalPage()) saved = await saveAsync(page, window.__wzState());
+    } catch (_) { }
+    finally { submitting = false; }
+    if (status) status.textContent = saved
+      ? '草稿已保存在这个浏览器里，返回首页或刷新后可继续制作。'
+      : !sameOwner() ? '登录账号已变化，请重新打开作品后再保存；本页内容不会覆盖其他账号的草稿。'
+      : lastFailure === 'account-conflict' ? '草稿未保存：账号中已有这款作品的草稿。请先保留本页修改，再重新打开作品核对，避免覆盖已有草稿。'
+      : lastFailure === 'conflict' ? '草稿未保存：另一个标签页已保存新版本。请先保留本页修改，再重新打开作品核对，避免覆盖新草稿。'
+      : '草稿未保存：浏览器存储空间不足或未获授权，请勿离开页面；可减少图片、音频后重试。';
+  }, true);
+})();
